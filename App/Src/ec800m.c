@@ -427,6 +427,40 @@ bool mdm_mqtt_publish(const char *topic, const char *payload)
     return true;
 }
 
+/*
+ * Gio dia phuong tu mang (NITZ). AT+QLTS=2 -> +QLTS: "2026/10/19,11:30:45+28,0"
+ * Mang chua gui gio thi tra ve chuoi rong -> thu AT+CCLK? ("26/10/19,11:30:45+28").
+ */
+static bool parse_net_time(const char *r, const char *tag, clk_time_t *t)
+{
+    int y, mo, d, h, mi, s;
+    const char *p = strstr(r, tag);
+    if (!p || (p = strchr(p, '"')) == NULL) { return false; }
+    if (sscanf(p + 1, "%d/%d/%d,%d:%d:%d", &y, &mo, &d, &h, &mi, &s) != 6) { return false; }
+    if (y < 100) { y += 2000; }
+    if (y < 2024 || y > 2099) { return false; }      /* chua dong bo: thuong ra 1980/2000 */
+    t->year = (uint16_t)y;
+    t->mon = (uint8_t)mo;
+    t->day = (uint8_t)d;
+    t->hour = (uint8_t)h;
+    t->min = (uint8_t)mi;
+    t->sec = (uint8_t)s;
+    return true;
+}
+
+bool mdm_get_time(clk_time_t *t)
+{
+    char r[96];
+    if (!alive) { return false; }
+    if (mdm_at("AT+QLTS=2", r, sizeof(r), 3000) == MDM_AT_OK && parse_net_time(r, "+QLTS:", t)) {
+        return true;
+    }
+    if (mdm_at("AT+CCLK?", r, sizeof(r), 3000) == MDM_AT_OK && parse_net_time(r, "+CCLK:", t)) {
+        return true;
+    }
+    return false;
+}
+
 void mdm_sim_retry_now(void)
 {
     t_sim_retry = HAL_GetTick() - CFG_SIM_RETRY_MS;

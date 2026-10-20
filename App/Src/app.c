@@ -1,15 +1,21 @@
 /*
  * Ung dung gateway:
  *   - Doc 3 dau vao opto, 2 cam bien luu luong, thanh ghi Modbus qua RS485
- *   - Nhan goi LoRa tu cac node
+ *   - Nhan goi LoRa tu cac node (lora_node.c), gui lenh xuong node
  *   - Gui tat ca len MQTT qua 4G (EC800M), nhan lenh dieu khien relay
+ *     Topic: <base>/<IMEI>/data      du lieu gateway
+ *            <base>/<IMEI>/node/<id> goi bao cao cua node (+ rssi/snr), {"id":..,"online":0/1}
+ *            <base>/<IMEI>/lora      goi LoRa la (hex)
+ *            <base>/<IMEI>/cmd       lenh: {"relay1":1} | {"node":"349CE1DF","cmd":"relay 1 1"} | chu
  *   - Hien thi trang thai len TFT
  *   - Console tren USART1 (CN6) de thu tung khoi, go "help"
  */
 #include "app.h"
 #include "board.h"
+#include "clock.h"
 #include "config.h"
 #include "ec800m.h"
+#include "lora_node.h"
 #include "modbus.h"
 #include "serial.h"
 #include "sx1262.h"
@@ -25,15 +31,14 @@ extern I2C_HandleTypeDef hi2c2;
 
 static bool lora_ok, flash_ok, tft_ok;
 static int csq = 99;
-static char topic_data[64], topic_lora[64], topic_cmd[64];
+static char topic_data[64], topic_cmd[64];
 
 static mb_status_t mb_st = MB_ERR_TIMEOUT;
 static uint16_t mb_regs[MB_MAX_REGS];
 
-static uint32_t lora_rx_count;
-static int16_t lora_last_rssi;
-
 static uint32_t t_1s, t_mb, t_pub, t_net, t_csq;
+static uint32_t t_time_try, t_time_ok;
+static bool time_synced;            /* da lay duoc gio mang tu luc bat may */
 static bool net_tried;
 static bool pub_now;
 
@@ -91,24 +96,51 @@ static void print_status(void)
         for (int i = 0; i < CFG_MB_REG_COUNT; i++) { printf(" %u", mb_regs[i]); }
     }
     printf("\n");
-    printf("LoRa   : %s, da nhan %lu goi, RSSI cuoi %d dBm\n", lora_ok ? "OK" : "LOI",
-           (unsigned long)lora_rx_count, lora_last_rssi);
+    printf("LoRa   : %s, da nhan %lu goi, RSSI cuoi %d dBm, node online %d/%d (lenh \"nodes\")\n",
+           lora_ok ? "OK" : "LOI", (unsigned long)lora_rx_total(), lora_last_rssi(),
+           lora_node_online(), lora_node_known());
     printf("4G     : %s, IMEI %s, CSQ %d, MQTT %s\n", mdm_is_on() ? "bat" : "tat",
            mdm_imei(), csq, mdm_mqtt_connected() ? "OK" : "chua ket noi");
     printf("Flash  : %s, TFT: %s\n", flash_ok ? "OK" : "LOI", tft_ok ? "da khoi tao" : "-");
+    char ts[24];
+    clk_format(ts, sizeof(ts));
+    printf("Gio    : %s\n", ts[0] ? ts : "chua dat (cho gio tu mang 4G hoac lenh time)");
+}
+
+/* Lay gio tu mang 4G cho RTC: lan dau ngay khi co, sau do moi CFG_TIME_SYNC_MS */
+static void time_sync_task(void)
+{
+    uint32_t now = HAL_GetTick();
+    if (!mdm_sim_ready()) { return; }
+    if (time_synced && (now - t_time_ok) < CFG_TIME_SYNC_MS) { return; }
+    if ((now - t_time_try) < 30000u) { return; }      /* mang chua co gio: 30 s thu lai */
+    t_time_try = now;
+
+    clk_time_t t;
+    if (!mdm_get_time(&t)) { return; }
+    if (clk_set(&t)) {
+        time_synced = true;
+        t_time_ok = now;
+        printf("[RTC] Dong bo gio mang: %04u-%02u-%02u %02u:%02u:%02u\n",
+               t.year, t.mon, t.day, t.hour, t.min, t.sec);
+    }
 }
 
 static int build_json(char *buf, size_t len)
 {
-    int n = snprintf(buf, len,
-        "{\"up\":%lu,\"in\":[%d,%d,%d],\"rl\":[%d,%d],"
-        "\"f1\":{\"mlm\":%lu,\"ml\":%lu},\"f2\":{\"mlm\":%lu,\"ml\":%lu},\"csq\":%d,\"mb\":",
+    char ts[24];
+    clk_format(ts, sizeof(ts));
+    int n = snprintf(buf, len, "{");
+    if (ts[0]) { n += snprintf(buf + n, len - (size_t)n, "\"ts\":\"%s\",", ts); }
+    n += snprintf(buf + n, len - (size_t)n,
+        "\"up\":%lu,\"in\":[%d,%d,%d],\"rl\":[%d,%d],"
+        "\"f1\":{\"mlm\":%lu,\"ml\":%lu},\"f2\":{\"mlm\":%lu,\"ml\":%lu},\"csq\":%d,\"nodes\":%d,\"mb\":",
         (unsigned long)(HAL_GetTick() / 1000u),
         board_input_get(1), board_input_get(2), board_input_get(3),
         board_relay_get(1), board_relay_get(2),
         (unsigned long)board_flow_ml_per_min(1), (unsigned long)board_flow_total_ml(1),
         (unsigned long)board_flow_ml_per_min(2), (unsigned long)board_flow_total_ml(2),
-        csq);
+        csq, lora_node_online());
     if (mb_st == MB_OK) {
         n += snprintf(buf + n, len - (size_t)n, "[");
         for (int i = 0; i < CFG_MB_REG_COUNT; i++) {
@@ -119,6 +151,18 @@ static int build_json(char *buf, size_t len)
         n += snprintf(buf + n, len - (size_t)n, "null,\"mb_err\":\"%s\"}", mb_status_str(mb_st));
     }
     return n;
+}
+
+bool app_publish(const char *suffix, const char *payload)
+{
+    char topic[96];
+    if (!mdm_mqtt_connected()) { return false; }
+    snprintf(topic, sizeof(topic), "%s/%s/%s", CFG_TOPIC_BASE, mdm_imei(), suffix);
+    if (!mdm_mqtt_publish(topic, payload)) {
+        printf("[PUB] %s that bai\n", topic);
+        return false;
+    }
+    return true;
 }
 
 static void publish_data(void)
@@ -137,6 +181,18 @@ static void cmd_exec(char *s, bool remote)
 {
     char *argv[6];
     int argc = 0;
+
+    /* Lenh cho node: {"node":"349CE1DF","cmd":"relay 1 1"} -> LoRa "@349CE1DF relay 1 1" */
+    if (s[0] == '{' && strstr(s, "\"node\"")) {
+        char id[12], ncmd[100];
+        if (!json_get_str(s, "node", id, sizeof(id)) || !json_get_str(s, "cmd", ncmd, sizeof(ncmd)) ||
+            id[0] == '\0' || ncmd[0] == '\0') {
+            printf("Lenh node sai dinh dang, can {\"node\":\"<id>\",\"cmd\":\"<lenh>\"}\n");
+            return;
+        }
+        lora_node_send(id, ncmd);
+        return;
+    }
 
     /* JSON tu server: {"relay1":1,"relay2":0} */
     if (s[0] == '{') {
@@ -173,8 +229,17 @@ static void cmd_exec(char *s, bool remote)
             if (i > 1) { strncat(msg, " ", sizeof(msg) - strlen(msg) - 1); }
             strncat(msg, argv[i], sizeof(msg) - strlen(msg) - 1);
         }
-        bool ok = sx1262_send((const uint8_t *)msg, (uint8_t)strlen(msg), 5000);
-        printf("LoRa gui \"%s\": %s\n", msg, ok ? "OK" : "LOI");
+        lora_send_raw(msg);
+    } else if (strcmp(argv[0], "node") == 0 && argc >= 3) {
+        /* node <id|*> <lenh...>  ==  lora @<id> <lenh...> */
+        char ncmd[100] = "";
+        for (int i = 2; i < argc; i++) {
+            if (i > 2) { strncat(ncmd, " ", sizeof(ncmd) - strlen(ncmd) - 1); }
+            strncat(ncmd, argv[i], sizeof(ncmd) - strlen(ncmd) - 1);
+        }
+        lora_node_send(argv[1], ncmd);
+    } else if (strcmp(argv[0], "nodes") == 0) {
+        lora_node_print();
     } else if (strcmp(argv[0], "mb") == 0 && argc == 5) {
         uint16_t v[MB_MAX_REGS];
         uint16_t cnt = (uint16_t)atoi(argv[4]);
@@ -201,6 +266,19 @@ static void cmd_exec(char *s, bool remote)
         printf("%s%s\n", r, st == MDM_AT_OK ? "OK" : st == MDM_AT_ERROR ? "" : "[timeout]");
     } else if (strcmp(argv[0], "diag") == 0) {
         mdm_diag();
+    } else if (strcmp(argv[0], "time") == 0) {
+        char ts[24];
+        if (argc == 3) {
+            char both[24];
+            clk_time_t t;
+            snprintf(both, sizeof(both), "%s %s", argv[1], argv[2]);
+            if (!clk_parse(both, &t) || !clk_set(&t)) {
+                printf("Sai dinh dang: time YYYY-MM-DD HH:MM:SS\n");
+                return;
+            }
+        }
+        clk_format(ts, sizeof(ts));
+        printf("Gio RTC: %s\n", ts[0] ? ts : "chua dat");
     } else if (strcmp(argv[0], "call") == 0 && argc >= 2) {
         uint32_t sec = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 30u;
         mdm_call(argv[1], sec * 1000u);
@@ -225,10 +303,13 @@ static void cmd_exec(char *s, bool remote)
                "  relay <1|2> <0|1>       dong/ngat relay\n"
                "  mb <slave> <fc> <addr> <n>   doc thanh ghi Modbus (fc 3/4)\n"
                "  mbw <slave> <addr> <val>     ghi 1 thanh ghi\n"
-               "  lora <noi dung>         gui goi LoRa\n"
+               "  lora <noi dung>         gui nguyen chuoi qua LoRa\n"
+               "  node <id|*> <lenh>      gui lenh cho node (vd: node 349CE1DF relay 1 1)\n"
+               "  nodes                   bang node LoRa (online, mat goi, RSSI)\n"
                "  at <lenh>               gui lenh AT xuong EC800M\n"
                "  net                     ket noi lai 4G/MQTT\n"
                "  diag                    chan doan SIM / song 4G\n"
+               "  time [YYYY-MM-DD HH:MM:SS]  xem / dat gio RTC\n"
                "  call <so> [giay]        goi thoai, tu cup sau 30 s\n"
                "  sms <so> <noi dung>     nhan tin (chu khong dau)\n"
                "  pub                     gui du lieu len MQTT ngay\n"
@@ -319,12 +400,20 @@ static void tft_update(void)
         snprintf(s, sizeof(s), "MB:%s", mb_status_str(mb_st));
     }
     tft_line(5, s, mb_st == MB_OK ? TFT_WHITE : TFT_RED);
-    snprintf(s, sizeof(s), "LORA:%s rx%lu %ddBm", lora_ok ? "OK" : "ERR",
-             (unsigned long)lora_rx_count, lora_last_rssi);
-    tft_line(6, s, lora_ok ? TFT_WHITE : TFT_RED);
-    snprintf(s, sizeof(s), "UP %02lu:%02lu:%02lu", (unsigned long)(up / 3600u),
-             (unsigned long)((up / 60u) % 60u), (unsigned long)(up % 60u));
-    tft_line(7, s, TFT_GRAY);
+    snprintf(s, sizeof(s), "LORA:%s NODE %d/%d %ddBm", lora_ok ? "OK" : "ERR",
+             lora_node_online(), lora_node_known(), lora_last_rssi());
+    tft_line(6, s, !lora_ok ? TFT_RED : (lora_node_online() < lora_node_known()) ? TFT_YELLOW : TFT_WHITE);
+    if (clk_valid()) {
+        clk_time_t t;
+        clk_get(&t);
+        snprintf(s, sizeof(s), "%02u/%02u/%04u %02u:%02u:%02u",
+                 t.day, t.mon, t.year, t.hour, t.min, t.sec);
+        tft_line(7, s, TFT_CYAN);
+    } else {
+        snprintf(s, sizeof(s), "UP %02lu:%02lu:%02lu", (unsigned long)(up / 3600u),
+                 (unsigned long)((up / 60u) % 60u), (unsigned long)(up % 60u));
+        tft_line(7, s, TFT_GRAY);
+    }
 }
 
 /* ---------------- mang ---------------- */
@@ -347,10 +436,9 @@ static void net_task(void)
     char client[40];
     snprintf(client, sizeof(client), "gw-%s", mdm_imei());
     snprintf(topic_data, sizeof(topic_data), "%s/%s/data", CFG_TOPIC_BASE, mdm_imei());
-    snprintf(topic_lora, sizeof(topic_lora), "%s/%s/lora", CFG_TOPIC_BASE, mdm_imei());
     snprintf(topic_cmd,  sizeof(topic_cmd),  "%s/%s/cmd",  CFG_TOPIC_BASE, mdm_imei());
     if (mdm_mqtt_connect(client, topic_cmd)) {
-        printf("[4G] Topic: %s | %s | %s\n", topic_data, topic_lora, topic_cmd);
+        printf("[4G] Topic: %s | .../node/<id> | .../lora | %s\n", topic_data, topic_cmd);
         pub_now = true;
     }
 }
@@ -382,29 +470,12 @@ static void input_relay_task(void)
 #endif
 }
 
-/* Driver 4G co the cho hang chuc giay: van cho relay theo dau vao */
+/* Driver 4G co the cho hang chuc giay: van cho relay theo dau vao va hut goi LoRa vao
+ * hang doi (SX1268 chi giu 1 goi). KHONG publish o day - driver modem dang ban. */
 void mdm_idle(void)
 {
     input_relay_task();
-}
-
-static void lora_task(void)
-{
-    sx1262_packet_t pkt;
-    if (!sx1262_poll_rx(&pkt)) { return; }
-
-    lora_rx_count++;
-    lora_last_rssi = pkt.rssi;
-
-    /* Chuyen tiep dang hex + do manh tin hieu */
-    char json[2 * SX1262_MAX_PAYLOAD + 64];
-    int n = snprintf(json, sizeof(json), "{\"rssi\":%d,\"snr\":%d,\"hex\":\"", pkt.rssi, pkt.snr);
-    for (int i = 0; i < pkt.len; i++) {
-        n += snprintf(json + n, sizeof(json) - (size_t)n, "%02X", pkt.data[i]);
-    }
-    snprintf(json + n, sizeof(json) - (size_t)n, "\"}");
-    printf("[LORA] %u byte, RSSI %d SNR %d: %s\n", pkt.len, pkt.rssi, pkt.snr, json);
-    if (mdm_mqtt_connected()) { mdm_mqtt_publish(topic_lora, json); }
+    lora_rx_poll();
 }
 
 /* ---------------------------------------------------------------- */
@@ -425,9 +496,10 @@ void app_init(void)
     lora_ok = sx1262_init();
     if (lora_ok) {
         uint16_t e = sx1262_device_errors();
-        printf("LoRa SX1262: OK %lu Hz SF%d BW%d, loi thiet bi 0x%04X%s\n",
+        printf("LoRa S68F/SX1268: OK %lu Hz SF%d BW%d, loi thiet bi 0x%04X%s\n",
                (unsigned long)CFG_LORA_FREQ_HZ, CFG_LORA_SF, CFG_LORA_BW, e,
-               (e & 0x20u) ? " (XOSC loi -> thu CFG_LORA_USE_TCXO=1)" : "");
+               (e & 0x20u) ? " (XOSC loi -> kiem tra TCXO)" : "");
+        lora_node_init();
         sx1262_start_rx();
     } else {
         printf("LoRa SX1262: KHONG tra loi SPI\n");
@@ -452,7 +524,7 @@ void app_loop(void)
     swd_cmd_poll();
     input_relay_task();
     mdm_poll();
-    lora_task();
+    lora_node_task();
 
     if (now - t_1s >= 1000u) {
         t_1s = now;
@@ -473,6 +545,7 @@ void app_loop(void)
     }
 
     net_task();
+    time_sync_task();
 
     if (pub_now || (now - t_pub) >= CFG_PUBLISH_PERIOD_MS) {
         pub_now = false;

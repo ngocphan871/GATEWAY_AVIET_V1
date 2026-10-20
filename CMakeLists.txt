@@ -47,7 +47,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     App/Src/app.c
     App/Src/board.c
+    App/Src/clock.c
     App/Src/ec800m.c
+    App/Src/lora_node.c
     App/Src/modbus.c
     App/Src/serial.c
     App/Src/sx1262.c

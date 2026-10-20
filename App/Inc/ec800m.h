@@ -14,6 +14,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "clock.h"
 
 typedef enum {
     MDM_AT_OK = 0,
@@ -39,7 +40,10 @@ bool mdm_mqtt_connected(void);
 bool mdm_mqtt_publish(const char *topic, const char *payload);
 void mdm_mqtt_disconnect(void);
 
-void mdm_sim_retry_now(void);               /* lan ket noi toi se tat/bat radio de nhan lai SIM */
+/* Gio dia phuong do mang 4G cung cap (NITZ). false neu mang chua gui gio. */
+bool mdm_get_time(clk_time_t *t);
+
+void mdm_sim_retry_now(void);              /* lan ket noi toi se tat/bat radio de nhan lai SIM */
 
 /* Goi thoai toi so num, tu cup may sau max_ms neu ben kia chua cup */
 bool mdm_call(const char *num, uint32_t max_ms);
